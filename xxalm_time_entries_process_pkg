@@ -1,0 +1,658 @@
+create or replace package body xxalm_time_entries_process_pkg as
+
+  function time_to_minutes (
+    time_in_hours_mins in varchar2
+  ) return number is
+    v_minutes number;
+  begin
+    v_minutes := mod(time_in_hours_mins, 100) + trunc(time_in_hours_mins / 100) * 60;
+
+    return v_minutes;
+  end time_to_minutes;
+
+  function minutes_to_hours_minutes (
+    p_minutes in number
+  ) return varchar2 is
+    v_hours   number;
+    v_minutes number;
+  begin
+    v_hours := trunc(p_minutes / 60);
+    v_minutes := mod(p_minutes, 60);
+    return lpad(v_hours, 2, '0')
+           || ':'
+           || lpad(v_minutes, 2, '0');
+
+  end;
+
+  procedure insert_payroll_elements (
+    p_sl_no      in varchar2,
+    p_time_type  in varchar2,
+    p_start_date date,
+    p_start_time in varchar2,
+    p_stop_time  in varchar2,
+    p_measure    in number
+  ) is
+  begin
+    if p_time_type = 'Absent OTL' then
+      insert into xxalm_payroll_elements (
+        sl_no,
+        time_type,
+        "MEASURE"
+      ) values (
+        p_sl_no,
+        p_time_type,
+        p_measure
+      );
+
+    else
+      insert into xxalm_payroll_elements (
+        sl_no,
+        time_type,
+        start_time,
+        stop_time
+      ) values (
+        p_sl_no,
+        p_time_type,
+        to_date(to_char(p_start_date, 'YYYY-MM-DD')
+                || ' '
+                || p_start_time, 'YYYY-MM-DD HH24MISS'),
+        to_date(to_char(p_start_date, 'YYYY-MM-DD')
+                || ' '
+                || p_stop_time, 'YYYY-MM-DD HH24MISS')
+      );
+
+    end if;
+  end insert_payroll_elements;
+
+  procedure process_time_entries (
+    integration_id in varchar2,
+    status         out varchar2
+  ) as
+  begin
+    for rec in (
+      select
+        substr(sl_no, 0, instr(sl_no, 'x') - 1)                             sl_no,
+        employee_no,
+        start_date,
+        shift_name,
+        shift_start_time,
+        shift_end_time,
+        break_start_time,
+        break_stop_time,
+        to_char(to_date(min(in_time), 'DD-Mon-YYYY HH24:MI:SS'), 'HH24MI')  in_time,
+        to_char(to_date(max(out_time), 'DD-Mon-YYYY HH24:MI:SS'), 'HH24MI') out_time,
+        case
+          when count(*) > 1 then
+            to_char(to_date(min(out_time), 'DD-Mon-YYYY HH24:MI:SS'), 'HH24MI')
+        end                                                                 break_out_time,
+        case
+          when count(*) > 1 then
+            to_char(to_date(max(in_time), 'DD-Mon-YYYY HH24:MI:SS'), 'HH24MI')
+        end                                                                 break_in_time,
+        off_day
+      from
+        xxalm_time_entries_stg
+      where
+        status = 'I'
+      group by
+        substr(sl_no, 0, instr(sl_no, 'x') - 1),
+        employee_no,
+        start_date,
+        shift_name,
+        shift_start_time,
+        shift_end_time,
+        break_start_time,
+        break_stop_time,
+        off_day
+    ) loop
+      declare
+        v_employee_exists                 number := 0;
+        v_assignment_status               varchar2(50) := null;
+        v_assignment_effective_start_date date := null;
+        v_start_time_1                    varchar2(50) := null;
+        v_stop_time_1                     varchar2(50) := null;
+        v_start_time_2                    varchar2(50) := null;
+        v_stop_time_2                     varchar2(50) := null;
+        v_time_type                       varchar2(50) := null;
+        v_normal_hours                    number := 0;
+        v_shift_hours                     number := 0;
+        v_over_time                       varchar2(3) := null;
+        v_off_day                         varchar2(1) := 'N';
+        v_count                           number := 0;
+        v_record_exists                   number := 0;
+      begin
+        select
+          count(*)
+        into v_record_exists
+        from
+          xxalm_time_entries
+        where
+          sl_no = rec.sl_no;
+
+        if v_record_exists = 0 then
+          select
+            count(*)
+          into v_employee_exists
+          from
+            xxalm_overtime_eligibility
+          where
+            person_number = trim(rec.employee_no);
+
+          if v_employee_exists > 0 then
+            select
+              assignment_status,
+              trunc(effective_start_date),
+              case
+                when custom_over_time = 'YES'
+                     and rec.start_date between nvl(custom_over_time_start_date, to_date('01-01-2000', 'DD-MM-YYYY')) and nvl(custom_over_time_end_date,
+                     to_date('01-01-3000', 'DD-MM-YYYY')) then
+                  'YES'
+                when custom_over_time = 'NO' then
+                  'NO'
+                when assignment_over_time is not null then
+                  assignment_over_time
+                else
+                  'NO'
+              end as result
+            into
+              v_assignment_status,
+              v_assignment_effective_start_date,
+              v_over_time
+            from
+              xxalm_overtime_eligibility
+            where
+              person_number = trim(rec.employee_no);
+
+          end if;
+
+          select
+            count(1)
+          into v_count
+          from
+            xxalm_public_holiday_calendar
+          where
+            rec.start_date between start_date and end_date
+            and rownum = 1;
+
+          v_off_day :=
+            case
+              when upper(rec.off_day) = 'Y' then
+                rec.off_day
+              when v_count = 1 then
+                'Y'
+              else 'N'
+            end;
+
+          insert into xxalm_time_entries (
+            sl_no,
+            employee_no,
+            start_date,
+            shift_name,
+            shift_start_time,
+            shift_end_time,
+            break_start_time,
+            break_stop_time,
+            in_time,
+            out_time,
+            break_in_time,
+            break_out_time,
+            off_day,
+            status
+          ) values (
+            rec.sl_no,
+            trim(rec.employee_no),
+            rec.start_date,
+            rec.shift_name,
+            rec.shift_start_time,
+            rec.shift_end_time,
+            rec.break_start_time,
+            rec.break_stop_time,
+            rec.in_time,
+            rec.out_time,
+            rec.break_in_time,
+            rec.break_out_time,
+            v_off_day,
+            'N'
+          );
+
+          if v_employee_exists = 0 then
+            update xxalm_time_entries
+            set
+              status = 'E',
+              comments = 'Employee does not exists'
+            where
+              sl_no = rec.sl_no;
+
+            continue;
+          end if;
+
+          if
+            v_assignment_status = 'Inactive - Payroll Eligible'
+            and trunc(rec.start_date) >= trunc(v_assignment_effective_start_date)
+          then
+            update xxalm_time_entries
+            set
+              status = 'E',
+              comments = 'Inactive - Payroll Eligible'
+            where
+              sl_no = rec.sl_no;
+
+            continue;
+          end if;
+
+        --Absent OTL
+          if
+            rec.in_time is null
+            and nvl(v_off_day, 'N') = 'N'
+          then
+            insert_payroll_elements(rec.sl_no, 'Absent OTL', null, null, null,
+                                   1);
+          end if;
+       
+        --Normal Hours and Overtime Weekday 1_25
+          if
+            rec.in_time is not null
+            and rec.out_time > rec.shift_start_time
+            and nvl(v_off_day, 'N') = 'N'
+          then
+          -- shift with no defined breaks
+            if rec.break_start_time = rec.shift_start_time or rec.break_start_time = rec.shift_end_time then
+            -- takes a break
+              if rec.break_out_time is not null then
+              --logins on or before shift_start_time and takes a break before shift_start_time
+                if
+                  rec.in_time <= rec.shift_start_time
+                  and rec.break_out_time <= rec.shift_start_time
+                then
+                  v_start_time_1 := greatest(rec.shift_start_time, rec.break_in_time);
+                  v_stop_time_1 := rec.out_time;
+                else
+                  v_start_time_1 := rec.in_time;
+                  v_stop_time_1 := rec.break_out_time;
+                  insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                         null);
+
+                  v_start_time_2 := rec.break_in_time;
+                  v_stop_time_2 := rec.out_time;
+                end if;
+              else
+                v_start_time_1 := greatest(rec.shift_start_time, rec.in_time);
+                v_stop_time_1 := rec.out_time;
+              end if;
+
+              if ( v_start_time_2 is not null ) then
+                v_normal_hours := ( time_to_minutes(v_stop_time_1) - time_to_minutes(v_start_time_1) ) + ( time_to_minutes(v_stop_time_2) -
+                time_to_minutes(v_start_time_2) );
+
+                v_start_time_1 := v_start_time_2;
+                v_stop_time_1 := v_stop_time_2;
+              else
+                v_normal_hours := ( time_to_minutes(v_stop_time_1) - time_to_minutes(v_start_time_1) );
+              end if;
+
+              v_shift_hours := ( time_to_minutes(rec.shift_end_time) - time_to_minutes(rec.shift_start_time) ) - ( time_to_minutes(rec.
+              break_stop_time) - time_to_minutes(rec.break_start_time) );
+
+              if
+                upper(v_over_time) = 'YES'
+                and rec.out_time > rec.shift_end_time
+                and ( v_normal_hours - v_shift_hours ) > 31
+              then
+                v_stop_time_1 := rec.shift_end_time;
+                insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+                v_start_time_1 := rec.shift_end_time;
+                if ( rec.break_out_time > rec.shift_end_time ) then
+                  v_stop_time_1 := rec.break_out_time;
+                else
+                  v_stop_time_1 := rec.out_time;
+                end if;
+
+                insert_payroll_elements(rec.sl_no, 'Overtime Weekday 1_25', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+                if ( rec.break_in_time > rec.shift_end_time ) then
+                  v_start_time_1 := greatest(rec.break_in_time, rec.shift_end_time);
+                  v_stop_time_1 := rec.out_time;
+                  insert_payroll_elements(rec.sl_no, 'Overtime Weekday 1_25', rec.start_date, v_start_time_1, v_stop_time_1,
+                                         null);
+
+                end if;
+
+              else
+                insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+              end if;
+              
+          -- Both in_time and out_time are within the break time. 
+            elsif
+              rec.in_time >= rec.break_start_time
+              and rec.out_time <= rec.break_stop_time
+            then
+              dbms_output.put_line('Both in_time and out_time are within the break time.');                             
+          
+          -- shift with defined breaks
+            else
+              if rec.in_time >= rec.break_stop_time then
+                v_start_time_1 := rec.in_time;
+              elsif rec.in_time >= rec.break_start_time then
+                if
+                  ( rec.break_out_time is not null )
+                  and rec.break_out_time <= rec.break_stop_time
+                then
+                  v_start_time_1 := rec.break_in_time;
+                else
+                  v_start_time_1 := rec.break_stop_time;
+                end if;
+              elsif rec.in_time > rec.shift_start_time then
+                v_start_time_1 := rec.in_time;
+              else
+                v_start_time_1 := rec.shift_start_time;
+              end if;
+            
+            -- takes a break 
+              if rec.break_out_time is not null then
+                if rec.break_out_time <= rec.break_start_time then
+                  v_stop_time_1 := rec.break_out_time;
+                elsif rec.break_out_time <= rec.break_stop_time then
+                  if rec.in_time < rec.break_start_time then
+                    v_stop_time_1 := rec.break_start_time;
+                  else
+                    v_stop_time_1 := rec.out_time;
+                  end if;
+                else
+                  if rec.in_time < rec.break_start_time then
+                    v_stop_time_1 := rec.break_start_time;
+                  else
+                    v_stop_time_1 := rec.break_out_time;
+                  end if;
+                end if;
+
+                insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+              
+          
+           -- no break
+              else
+                if rec.out_time <= rec.break_start_time then
+                  v_stop_time_1 := rec.out_time;
+                elsif rec.out_time <= rec.break_stop_time then
+                  v_stop_time_1 := rec.break_start_time;
+                else
+                  if rec.in_time > rec.break_start_time then
+                    v_stop_time_1 := rec.out_time;
+                  elsif rec.in_time < rec.break_start_time then
+                    v_stop_time_1 := rec.break_start_time;
+                  end if;
+                end if;
+
+                insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+              end if;
+
+              if v_stop_time_1 != rec.out_time then
+                if rec.out_time > rec.break_stop_time then
+                -- set start time for period 2
+                  if rec.break_in_time is null then
+                    v_start_time_2 := rec.break_stop_time;
+                  else
+                    if rec.break_in_time < rec.break_stop_time then
+                      v_start_time_2 := rec.break_stop_time;
+                    elsif v_stop_time_1 > rec.break_stop_time then
+                      v_start_time_2 := rec.break_in_time;
+                    elsif rec.break_out_time > rec.break_stop_time then
+                      v_start_time_2 := rec.break_stop_time;
+                    else
+                      v_start_time_2 := rec.break_in_time;
+                    end if;
+                  end if;
+               -- set stop time for period 2
+                  v_stop_time_2 := rec.out_time;
+                  v_normal_hours := ( time_to_minutes(v_stop_time_1) - time_to_minutes(v_start_time_1) ) + ( time_to_minutes(v_stop_time_2) -
+                  time_to_minutes(v_start_time_2) );
+
+                  v_shift_hours := ( time_to_minutes(rec.shift_end_time) - time_to_minutes(rec.shift_start_time) ) - ( time_to_minutes(
+                  rec.break_stop_time) - time_to_minutes(rec.break_start_time) );
+
+                  if
+                    upper(v_over_time) = 'YES'
+                    and rec.out_time > rec.shift_end_time
+                    and ( v_normal_hours - v_shift_hours ) > 31
+                  then
+                    v_stop_time_2 := rec.shift_end_time;
+                    insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_2, v_stop_time_2,
+                                           null);
+
+                    v_start_time_1 := rec.shift_end_time;
+                    if ( rec.break_out_time > rec.shift_end_time ) then
+                      v_stop_time_1 := rec.break_out_time;
+                    else
+                      v_stop_time_1 := rec.out_time;
+                    end if;
+
+                    insert_payroll_elements(rec.sl_no, 'Overtime Weekday 1_25', rec.start_date, v_start_time_1, v_stop_time_1,
+                                           null);
+
+                    if ( rec.break_in_time > rec.shift_end_time ) then
+                      v_start_time_1 := greatest(rec.break_in_time, rec.shift_end_time);
+                      v_stop_time_1 := rec.out_time;
+                      insert_payroll_elements(rec.sl_no, 'Overtime Weekday 1_25', rec.start_date, v_start_time_1, v_stop_time_1,
+                                             null);
+
+                    end if;
+
+                  else
+                    insert_payroll_elements(rec.sl_no, 'Normal Hours', rec.start_date, v_start_time_2, v_stop_time_2,
+                                           null);
+                  end if;
+
+                end if;
+              end if;
+
+            end if;
+          end if;
+       
+        --Overtime Weekend 1_5
+        --If it's a holiday and an employee has IN and OUT hours, the total number of hours would consider as holiday overtime, excluding breaks if they are defined within the shift.
+          if
+            rec.in_time is not null
+            and nvl(v_off_day, 'N') = 'Y'
+            and upper(v_over_time) = 'YES'
+          then
+          -- shift with no defined breaks
+            if rec.break_start_time = rec.shift_start_time or rec.break_start_time = rec.shift_end_time then
+              if rec.break_out_time is not null then
+                v_start_time_1 := rec.in_time;
+                v_stop_time_1 := rec.break_out_time;
+                insert_payroll_elements(rec.sl_no, 'Overtime Weekend 1_5', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+                v_start_time_2 := rec.break_in_time;
+                v_stop_time_2 := rec.out_time;
+                insert_payroll_elements(rec.sl_no, 'Overtime Weekend 1_5', rec.start_date, v_start_time_2, v_stop_time_2,
+                                       null);
+
+              else
+                v_start_time_1 := rec.in_time;
+                v_stop_time_1 := rec.out_time;
+                insert_payroll_elements(rec.sl_no, 'Overtime Weekend 1_5', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+              end if;
+
+            else 
+            -- set start time for period 1
+              v_start_time_1 := rec.in_time;
+            -- set stop time for period 1
+              if rec.break_out_time is null or rec.break_out_time = rec.out_time then
+                v_stop_time_1 := rec.break_start_time;
+              else
+                v_stop_time_1 := greatest(rec.break_start_time, rec.break_out_time);
+              end if;
+
+              insert_payroll_elements(rec.sl_no, 'Overtime Weekend 1_5', rec.start_date, v_start_time_1, v_stop_time_1,
+                                     null);
+          
+
+
+            -- set start time for period 2
+              if rec.break_out_time is null or rec.break_out_time = rec.out_time then
+                v_start_time_2 := rec.break_stop_time;
+              else
+                v_start_time_2 := rec.break_in_time;
+              end if;
+          
+            -- set stop time for period 2
+              v_stop_time_2 := rec.out_time;
+              insert_payroll_elements(rec.sl_no, 'Overtime Weekend 1_5', rec.start_date, v_start_time_2, v_stop_time_2,
+                                     null);
+
+            end if;
+          end if;
+
+        --Non Working Hours
+          if
+            rec.in_time is not null
+            and nvl(v_off_day, 'N') = 'N'
+          then        
+          -- shift with no defined breaks
+            if rec.break_start_time = rec.shift_start_time or rec.break_start_time = rec.shift_end_time then
+            -- logins after shift end time
+              if rec.in_time > rec.shift_end_time then
+                v_start_time_1 := rec.shift_start_time;
+                v_stop_time_1 := rec.shift_end_time;
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+              elsif
+                rec.in_time > rec.shift_start_time
+                and rec.in_time <= rec.shift_end_time
+              then
+                v_start_time_1 := rec.shift_start_time;
+                v_stop_time_1 := rec.in_time;
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+              -- takes a break 
+                if rec.break_out_time is not null then
+                  v_start_time_1 := rec.break_out_time;
+                  v_stop_time_1 := rec.in_time;
+                  v_stop_time_1 := least(rec.break_in_time, rec.shift_end_time);
+                  insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                         null);
+
+                end if;
+
+              end if;
+
+            else
+              if
+                rec.in_time > rec.shift_start_time
+                and rec.in_time < rec.shift_end_time
+              then
+                v_start_time_1 := rec.shift_start_time;
+                if rec.in_time > rec.break_start_time then
+                  v_stop_time_1 := rec.break_start_time;
+                else
+                  v_stop_time_1 := rec.in_time;
+                end if;
+
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_1, v_stop_time_1,
+                                       null);
+
+              end if;
+
+              if rec.break_out_time < rec.break_start_time then
+                v_start_time_2 := rec.break_out_time;
+                v_stop_time_2 := rec.break_start_time;
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_2, v_stop_time_2,
+                                       null);
+
+              end if;
+
+              if
+                rec.break_out_time < rec.shift_end_time
+                and rec.break_in_time > rec.break_stop_time
+              then
+                if rec.break_out_time > rec.break_stop_time then
+                  v_start_time_2 := rec.break_out_time;
+                else
+                  v_start_time_2 := rec.break_stop_time;
+                end if;
+
+                v_stop_time_2 := least(rec.break_in_time, rec.shift_end_time);
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_2, v_stop_time_2,
+                                       null);
+
+              end if;
+
+              if rec.in_time >= rec.shift_end_time then
+                v_start_time_2 := rec.shift_start_time;
+                v_stop_time_2 := rec.break_start_time;
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_2, v_stop_time_2,
+                                       null);
+
+                v_start_time_2 := rec.break_stop_time;
+                v_stop_time_2 := rec.shift_end_time;
+                insert_payroll_elements(rec.sl_no, 'Non Working Hours', rec.start_date, v_start_time_2, v_stop_time_2,
+                                       null);
+
+              end if;
+
+            end if;
+          end if;
+       
+       --Early Exit N
+          if
+            rec.in_time is not null
+            and nvl(v_off_day, 'N') = 'N'
+          then
+            if rec.out_time < rec.shift_start_time then
+              v_start_time_2 := rec.out_time;
+              v_stop_time_2 := rec.break_start_time;
+              insert_payroll_elements(rec.sl_no, 'Early Exit N', rec.start_date, v_start_time_2, v_stop_time_2,
+                                     null);
+
+              v_start_time_2 := rec.break_stop_time;
+              v_stop_time_2 := rec.shift_end_time;
+              insert_payroll_elements(rec.sl_no, 'Early Exit N', rec.start_date, v_start_time_2, v_stop_time_2,
+                                     null);
+
+            elsif rec.out_time < rec.shift_end_time then
+              v_start_time_2 := rec.out_time;
+              v_stop_time_2 := rec.shift_end_time;
+              insert_payroll_elements(rec.sl_no, 'Early Exit N', rec.start_date, v_start_time_2, v_stop_time_2,
+                                     null);
+
+            end if;
+          end if;
+
+        else
+          update xxalm_time_entries_stg
+          set
+            status = 'D'
+          where
+              status = 'I'
+            and sl_no like rec.sl_no || '%';
+
+        end if;
+
+      end;
+
+      update xxalm_time_entries_stg
+      set
+        status = 'P'
+      where
+          status = 'I'
+        and sl_no like sl_no || '%';
+
+      commit;
+    end loop;
+
+    commit;
+  end;
+
+end xxalm_time_entries_process_pkg;
